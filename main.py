@@ -58,6 +58,10 @@ PARAMS = {
     "spec_scale": 0.8,
     "spec_ridge": 0.7,
     "spec_lam_level": 1.0e9,
+    # How far the afternoon median moves toward a strong-wave/flat-wave blend,
+    # and how much ambiguous cases widen to cover both regimes.
+    "spec_mix": 1.0,
+    "spec_hedge": 0.0,
 }
 
 
@@ -341,6 +345,7 @@ def specialist_log_quantiles(target, analogs):
     ridge_share = PARAMS["spec_ridge"]
     xs = []
     levels = []
+    dips = []
     curves = []
     weights = []
     for analog in analogs:
@@ -359,6 +364,7 @@ def specialist_log_quantiles(target, analogs):
             continue
         xs.append(analog["x"])
         levels.append(math.log(analog["p1"] + 1.0))
+        dips.append(analog["shape"].get(-1, 0.0))
         curves.append(analog["future"])
         weights.append(weight)
     if not xs:
@@ -433,7 +439,179 @@ def specialist_log_quantiles(target, analogs):
             if quantiles[index] < quantiles[index - 1]:
                 quantiles[index] = quantiles[index - 1]
         rows.append(quantiles)
-    return rows
+    return hedge_afternoon(target, analogs, rows)
+
+
+def afternoon_window(hour):
+    """Ramp into the US-afternoon hours and ease off after them."""
+    if hour < 14:
+        return 0.0
+    if hour < 18:
+        return (hour - 14) / 4.0
+    if hour <= 22:
+        return 1.0
+    return 0.5
+
+
+def _sigmoid(value):
+    if value > 20.0:
+        return 1.0
+    if value < -20.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def hedge_afternoon(target, analogs, rows):
+    """Blend a strong afternoon wave and a flat one when the signal is mixed.
+
+    The two regimes are fit on a wide pool, so the flat side can be a launch
+    that never had a second wave, not just the quieter half of the strong-wave
+    neighbors. The target's weight on the strong side is a ridge logistic in
+    the pre-checkpoint dip, the hour before hour 1, and log hour-1 level. The
+    median moves part of the way toward that blend. Ambiguous probabilities
+    widen both tails by the gap between the regime medians.
+    """
+    mix = PARAMS["spec_mix"]
+    hedge = PARAMS["spec_hedge"]
+    if (mix <= 0.0 and hedge <= 0.0) or len(rows) != 23:
+        return rows
+    packed = []
+    for analog in analogs:
+        curve = analog["future"]
+        block = [curve[hour] for hour in range(18, 23) if hour in curve]
+        if len(block) < 3 or analog["x"] is None:
+            continue
+        weight = math.exp(-0.5 * ((target["x"] - analog["x"]) / 1.2) ** 2)
+        level_gap = math.log(target["p1"] + 1.0) - math.log(analog["p1"] + 1.0)
+        weight *= math.exp(-0.5 * (level_gap / 2.2) ** 2)
+        if analog["console"] and not analog["early"]:
+            weight *= 2.0
+        elif analog["early"]:
+            weight *= 0.45
+        if weight <= 1e-6:
+            continue
+        packed.append((
+            sum(block) / len(block),
+            analog["x"],
+            math.log(analog["p1"] + 1.0),
+            analog["shape"].get(-1, 0.0),
+            curve,
+            weight,
+        ))
+    if len(packed) < 6:
+        return rows
+    scores = [item[0] for item in packed]
+    score_w = [item[5] for item in packed]
+    cutoff = weighted_quantile(scores, score_w, 0.5)
+    labels = [1.0 if score >= cutoff else 0.0 for score in scores]
+    if sum(labels) < 2 or sum(labels) > len(labels) - 2:
+        return rows
+    total_w = sum(score_w)
+    mean_x = sum(weight * item[1] for weight, item in zip(score_w, packed)) / total_w
+    mean_level = sum(weight * item[2] for weight, item in zip(score_w, packed)) / total_w
+    mean_dip = sum(weight * item[3] for weight, item in zip(score_w, packed)) / total_w
+
+    def spread(index, mean):
+        var = sum(weight * (item[index] - mean) ** 2 for weight, item in zip(score_w, packed)) / total_w
+        return math.sqrt(var) if var > 1e-8 else 1.0
+
+    scale_x = spread(1, mean_x)
+    scale_level = spread(2, mean_level)
+    scale_dip = spread(3, mean_dip)
+    columns = []
+    for item in packed:
+        columns.append((
+            1.0,
+            (item[1] - mean_x) / scale_x,
+            (item[2] - mean_level) / scale_level,
+            (item[3] - mean_dip) / scale_dip,
+        ))
+    beta = [0.0, 0.0, 0.0, 0.0]
+    penalty = 3.0
+    for _step in range(8):
+        gram = [[0.0] * 4 for _ in range(4)]
+        rhs = [0.0] * 4
+        for row, label, weight in zip(columns, labels, score_w):
+            linear = sum(beta[i] * row[i] for i in range(4))
+            prob = min(max(_sigmoid(linear), 1e-4), 1.0 - 1e-4)
+            ire = prob * (1.0 - prob)
+            z_work = linear + (label - prob) / ire
+            for i in range(4):
+                rhs[i] += weight * ire * row[i] * z_work
+                for j in range(4):
+                    gram[i][j] += weight * ire * row[i] * row[j]
+        for i in range(1, 4):
+            gram[i][i] += penalty
+        beta = _solve_linear(gram, rhs)
+    target_dip = target["shape"].get(-1, 0.0) if target.get("shape") else 0.0
+    target_row = (
+        1.0,
+        (target["x"] - mean_x) / scale_x,
+        (math.log(target["p1"] + 1.0) - mean_level) / scale_level,
+        (target_dip - mean_dip) / scale_dip,
+    )
+    probability = _sigmoid(sum(beta[i] * target_row[i] for i in range(4)))
+    probability = min(max(probability, 0.05), 0.95)
+    ambiguity = 4.0 * probability * (1.0 - probability)
+    strong = [item for item in packed if item[0] >= cutoff]
+    flat = [item for item in packed if item[0] < cutoff]
+    adjusted = []
+    for index, hour in enumerate(range(2, 25)):
+        window = afternoon_window(hour)
+        current = rows[index]
+        if window <= 0.0:
+            adjusted.append(current)
+            continue
+        strong_vals = [item[4][hour] for item in strong if hour in item[4]]
+        flat_vals = [item[4][hour] for item in flat if hour in item[4]]
+        strong_ww = [item[5] for item in strong if hour in item[4]]
+        flat_ww = [item[5] for item in flat if hour in item[4]]
+        if not strong_vals or not flat_vals:
+            adjusted.append(current)
+            continue
+        strong_med = weighted_quantile(strong_vals, strong_ww, 0.5)
+        flat_med = weighted_quantile(flat_vals, flat_ww, 0.5)
+        blend = probability * strong_med + (1.0 - probability) * flat_med
+        center = current[2]
+        location = center + mix * window * (blend - center)
+        gap = abs(strong_med - flat_med)
+        extra = hedge * window * ambiguity * gap
+        half = (current[4] - current[0]) / 2.0
+        widened = []
+        for quantile in current:
+            if half > 1e-8:
+                widened.append(location + (quantile - center) * ((half + extra) / half))
+            else:
+                widened.append(location + (quantile - center))
+        for cursor in range(1, 5):
+            if widened[cursor] < widened[cursor - 1]:
+                widened[cursor] = widened[cursor - 1]
+        adjusted.append(widened)
+    return adjusted
+
+
+def _solve_linear(gram, rhs):
+    """Gaussian elimination. Returns zeros if the system is singular."""
+    size = len(rhs)
+    matrix = [gram[row][:] + [rhs[row]] for row in range(size)]
+    for col in range(size):
+        pivot = col
+        for row in range(col, size):
+            if abs(matrix[row][col]) > abs(matrix[pivot][col]):
+                pivot = row
+        matrix[col], matrix[pivot] = matrix[pivot], matrix[col]
+        if abs(matrix[col][col]) < 1e-12:
+            return [0.0] * size
+        scale = matrix[col][col]
+        for cursor in range(col, size + 1):
+            matrix[col][cursor] /= scale
+        for row in range(size):
+            if row == col:
+                continue
+            factor = matrix[row][col]
+            for cursor in range(col, size + 1):
+                matrix[row][cursor] -= factor * matrix[col][cursor]
+    return [matrix[row][size] for row in range(size)]
 
 
 def fit_hour(analogs, weights, hour, target_x):

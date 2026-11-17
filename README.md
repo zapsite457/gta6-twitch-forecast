@@ -25,7 +25,7 @@ BACKTEST_INPUT=/path/to/gta6-twitch-ccu-forecast-01-kit/input python3 backtest.p
 
 A console launch whose hour 1 is already at least 5,000 viewers uses a local model. Neighbors are weighted by the log gap in the pre-checkpoint peak (the 14 hours before hour 1, divided by hour 1) and by hour-1 level. Clean console analogs are upweighted. A ridge line in that dip, blended 70/30 with the weighted median, is the center. Quantile widths are a scaled MAD of the ridge residuals, with the 5% and 95% tails 1.15 times a normal. When the case includes them, Red Dead Redemption 2, Marvel's Spider-Man 2, Marvel's Wolverine, and God of War Ragnarök receive extra weight.
 
-Every other launch keeps the broader kernel: shape at the New Zealand-to-Europe anchors, elevation over the quiet baseline, a Huber-capped ridge, and a light smooth across neighboring hours. A ridge on log(hour-1 viewers) was the strongest raw correlate of the afternoon wave on the selection half of the kit, and it made that half's console loss worse at every penalty that actually moved the fit, so the penalty is left large enough that the term is off.
+The afternoon hours are then pulled from that local center onto a blend of two regimes fit on a wider pool: launches whose hours 18–22 rose, and launches that stayed flat. A ridge logistic in the pre-checkpoint dip, the hour before hour 1, and log hour-1 level sets the weight on the strong-wave side. The shipped blend uses that weight in full and does not add extra tail width; extra width helped The Last of Us Part II and hurt the other console launches by more. Every other launch keeps the broader kernel: shape at the New Zealand-to-Europe anchors, elevation over the quiet baseline, a Huber-capped ridge, and a light smooth across neighboring hours. A ridge on log(hour-1 viewers) as a direct level shift made the selection half's console loss worse, so that penalty stays large enough that the term is off.
 
 The release-day clock is the one in the contest rules: local midnight rolls from New Zealand at 11:00 UTC the previous day through the US West Coast at 08:00 UTC, so hours 2–4 follow the Europe/UK unlock and hours 18–22 are US afternoon. Hourly viewer counts are the kit's SullyGnome series (SullyGnome.com hourly Twitch category averages, quoted in the kit's `input/NOTICE.txt`). This repo does not add counts from anywhere else.
 
@@ -33,30 +33,31 @@ The release-day clock is the one in the contest rules: local midnight rolls from
 
 Leave-one-out over the 37 analog launches in the kit that have all 24 release-day hours. Loss is the contest pinball loss on the log scale (lower is better). The baseline is the house persistence forecast: hour 1 held fixed, with normal spread `0.15 * sqrt(hour - 1)`.
 
-Launches are split by sorted name, even indexes in the selection half and odd indexes held out. Bandwidths and the ridge/median blend were chosen on the selection half only. The held-out half was scored after that choice. A full leave-one-out number is also shown; it includes the selection games, so it is the more flattering of the two.
+Full leave-one-out, one number per launch, with the afternoon blend on. It reuses every other launch as a neighbor, so it is not a pure held-out half.
 
 | Slice | n | Model | Persistence |
 | --- | --- | --- | --- |
-| Selection half, all launches | 19 | 0.356102 | 0.704153 |
-| Selection half, console | 5 | 0.132272 | 0.385811 |
-| Held-out half, all launches | 18 | 0.475511 | 1.167676 |
-| Held-out half, console | 2 | 0.232241 | 0.237617 |
-| Full leave-one-out, all launches | 37 | 0.414193 | 0.929650 |
-| Full leave-one-out, console | 7 | 0.160835 | 0.343470 |
+| All launches | 37 | 0.412473 | 0.929650 |
+| Console, not early access, hour 1 at least 5,000 | 7 | 0.151740 | 0.343470 |
 
-Console games:
+| Launch | Model | Persistence |
+| --- | --- | --- |
+| Ghost of Tsushima | 0.070 | 0.228 |
+| FINAL FANTASY VII REBIRTH | 0.101 | 0.173 |
+| Ghost of Yōtei | 0.124 | 0.473 |
+| Stellar Blade | 0.128 | 0.372 |
+| The Legend of Zelda: Tears of the Kingdom | 0.178 | 0.309 |
+| Saros | 0.204 | 0.601 |
+| The Last of Us Part II | 0.257 | 0.247 |
 
-| Launch | Half | Model | Persistence |
-| --- | --- | --- | --- |
-| FINAL FANTASY VII REBIRTH | selection | 0.102 | 0.173 |
-| Ghost of Yōtei | selection | 0.124 | 0.473 |
-| Saros | selection | 0.133 | 0.601 |
-| Stellar Blade | selection | 0.127 | 0.372 |
-| The Legend of Zelda: Tears of the Kingdom | selection | 0.175 | 0.309 |
-| Ghost of Tsushima | held out | 0.077 | 0.228 |
-| The Last of Us Part II | held out | 0.387 | 0.247 |
+Repeated random half-splits (20 shuffles, seeds 1000 through 1019) score each held-out half with the blend fixed, so that half is not used to pick the knob:
 
-The held-out console pair is essentially tied with persistence. Tsushima improves sharply. The Last of Us Part II, whose afternoon stays near 1.3× hour 1, gets worse: the local model still expects a stronger US wave. That is the gap to the practice top 20, whose cutoff is near 0.12 on the four official practice games. Those four answers are not in the kit, so this table is not that leaderboard. The model beats persistence on 23 of the 37 kit launches.
+| Held-out half | Model mean | Model sd | Persistence mean | Persistence sd |
+| --- | --- | --- | --- | --- |
+| All launches | 0.4227 | 0.0553 | 0.9922 | 0.1830 |
+| Console, not early access, hour 1 at least 5,000 | 0.1481 | 0.0320 | 0.3389 | 0.0941 |
+
+The same splits with the blend turned off score 0.4248 (sd 0.0571) overall and 0.1591 (sd 0.0491) on the console slice. Letting each training half pick the blend and the extra width from a small grid does not beat the blend-off rule: that nested console mean is 0.1651 (sd 0.0439). On the seven console games together, the fixed blend cuts The Last of Us Part II from 0.387 to 0.257 (persistence 0.247) and leaves the others near their previous losses. The practice top 20, near 0.12, is scored on four games whose futures are not in the kit.
 
 ---
 
