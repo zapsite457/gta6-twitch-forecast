@@ -4,14 +4,13 @@ The grader runs `python3 -P -s /bot/main.py` with one case in the input director
 expects `/output/<id>.out`. This program reads every `*.in` case and writes the five
 quantiles (5%, 25%, 50%, 75%, 95%) of concurrent viewers for hours 2 through 24.
 
-The forecast is of log(CCU_h / CCU_hour1). A console launch that already has an
-audience at hour 1 uses a local model: neighbors weighted by the pre-checkpoint
-dip and the hour-1 level, then a ridge line in that dip blended with the weighted
-median. Widths are a scaled MAD. Other launches keep the broader kernel regression.
-Named console peers (Red Dead Redemption 2, Spider-Man 2, Wolverine, God of War
-Ragnarok) get extra weight when the case includes them. A second ridge term on
-log(hour-1 viewers) was fit on one half of the kit and rejected there, so its
-penalty stays large enough to turn it off.
+The forecast is of log(CCU_h / CCU_hour1). The shipped quantiles are a 60/40
+geometric average of a local console model and a broad kernel. The local model
+weights neighbors by the pre-checkpoint dip, blends a strong afternoon wave with
+a flat one, and ramps that blend in from hour 8. The kernel uses a narrower
+scale and no empirical tail. Named console peers (Red Dead Redemption 2,
+Spider-Man 2, Wolverine, God of War Ragnarok) get extra weight when the case
+includes them.
 """
 
 import json
@@ -62,6 +61,19 @@ PARAMS = {
     # and how much ambiguous cases widen to cover both regimes.
     "spec_mix": 1.0,
     "spec_hedge": 0.0,
+    # 0 keeps the gaussian band around the blended median. 1 replaces the
+    # afternoon band with the empirical quantiles of the regime mixture.
+    "spec_qmix": 0.0,
+    # First hour that starts the ramp into the afternoon mixture. 14 is the
+    # shipped step; a smaller value makes the handoff longer.
+    "spec_ramp_start": 14,
+    # If hour 1 is far from the previous three hours, pull it toward them
+    # before the ratios are applied. 0 leaves hour 1 unchanged.
+    "spec_p1_guard": 0.0,
+    # 1 sends console launches through the broad kernel instead of the local model.
+    "spec_off": 0,
+    # 1 averages the local console model with the broad kernel's quantiles.
+    "spec_ensemble": 1,
 }
 
 
@@ -444,10 +456,11 @@ def specialist_log_quantiles(target, analogs):
 
 def afternoon_window(hour):
     """Ramp into the US-afternoon hours and ease off after them."""
-    if hour < 14:
+    start = PARAMS["spec_ramp_start"]
+    if hour < start:
         return 0.0
-    if hour < 18:
-        return (hour - 14) / 4.0
+    if hour < start + 4:
+        return (hour - start) / 4.0
     if hour <= 22:
         return 1.0
     return 0.5
@@ -583,6 +596,17 @@ def hedge_afternoon(target, analogs, rows):
                 widened.append(location + (quantile - center) * ((half + extra) / half))
             else:
                 widened.append(location + (quantile - center))
+        # Empirical quantiles of the two-regime mixture. A convex mix with the
+        # gaussian band keeps the morning-to-afternoon handoff monotone.
+        qmix = PARAMS["spec_qmix"] * window
+        if qmix > 0.0:
+            strong_sum = sum(strong_ww)
+            flat_sum = sum(flat_ww)
+            pool_vals = strong_vals + flat_vals
+            pool_w = [probability * weight / strong_sum for weight in strong_ww]
+            pool_w += [(1.0 - probability) * weight / flat_sum for weight in flat_ww]
+            empirical = [weighted_quantile(pool_vals, pool_w, tau) for tau in LEVELS]
+            widened = [(1.0 - qmix) * gauss + qmix * emp for gauss, emp in zip(widened, empirical)]
         for cursor in range(1, 5):
             if widened[cursor] < widened[cursor - 1]:
                 widened[cursor] = widened[cursor - 1]
@@ -676,7 +700,7 @@ def quantiles_to_viewers(p1, log_quantiles):
     return rounded
 
 
-def forecast_case(case):
+def _forecast_once(case):
     """Return {"hours": [{"hour", "q"}, ...]} for one case."""
     if case.get("levels") not in (None, LEVELS):
         # The contest fixes the five levels. A different request still gets those five.
@@ -695,6 +719,13 @@ def forecast_case(case):
         p1 = float(p1)
     day_epoch = parse_time(case["day_start"])
     points = target_series(case, day_epoch)
+    guard = PARAMS["spec_p1_guard"]
+    if guard > 0.0:
+        recent = [points[off] for off in (-3, -2, -1) if off in points and points[off] > 0]
+        if len(recent) >= 2:
+            recent_level = median(recent)
+            if recent_level > 0 and (p1 / recent_level < 0.6 or p1 / recent_level > 1.7):
+                p1 = math.exp((1.0 - guard) * math.log(p1) + guard * math.log(recent_level))
     profile = target_profile(case)
     target = {
         "p1": p1,
@@ -722,7 +753,12 @@ def forecast_case(case):
     weights = [kernel_weight(target, record) for record in analogs]
     hours = []
     asked = case.get("forecast") or [{"hour": hour} for hour in range(2, 25)]
-    clean_console = target["console"] and not target["early"] and p1 >= 5000
+    clean_console = (
+        target["console"]
+        and not target["early"]
+        and p1 >= 5000
+        and PARAMS["spec_off"] == 0
+    )
     specialist = specialist_log_quantiles(target, analogs) if clean_console else None
     raw = []
     for row in sorted(asked, key=lambda item: item["hour"]):
@@ -739,6 +775,49 @@ def forecast_case(case):
     for hour, fitted in raw:
         hours.append({"hour": hour, "q": quantiles_to_viewers(p1, fitted)})
     return {"hours": hours}
+
+
+def average_forecasts(first, second, weight):
+    """Geometric mean of two quantile vectors. Weight is the share on the first."""
+    hours = []
+    for left, right in zip(first["hours"], second["hours"]):
+        logs = []
+        for left_q, right_q in zip(left["q"], right["q"]):
+            logs.append(weight * math.log(left_q) + (1.0 - weight) * math.log(right_q))
+        for index in range(1, 5):
+            if logs[index] < logs[index - 1]:
+                logs[index] = logs[index - 1]
+        hours.append({"hour": left["hour"], "q": quantiles_to_viewers(1.0, logs)})
+    return {"hours": hours}
+
+
+def forecast_case(case):
+    """Local console model, or that model averaged with the broad kernel."""
+    if PARAMS["spec_ensemble"] != 1:
+        return _forecast_once(case)
+    saved = dict(PARAMS)
+    try:
+        PARAMS["spec_ensemble"] = 0
+        PARAMS["spec_off"] = 0
+        PARAMS["spec_ramp_start"] = 8
+        PARAMS["spec_qmix"] = 0.0
+        PARAMS["spec_mix"] = 1.0
+        PARAMS["spec_hedge"] = 0.0
+        PARAMS["spec_p1_guard"] = 0.0
+        local = _forecast_once(case)
+        PARAMS.clear()
+        PARAMS.update(saved)
+        PARAMS["spec_ensemble"] = 0
+        PARAMS["spec_off"] = 1
+        PARAMS["sm"] = 0.75
+        PARAMS["emp_blend"] = 0.0
+        PARAMS["lam"] = 0.8
+        PARAMS["tail"] = 1.15
+        kernel = _forecast_once(case)
+    finally:
+        PARAMS.clear()
+        PARAMS.update(saved)
+    return average_forecasts(local, kernel, 0.6)
 
 
 def smooth_log_quantiles(rows, bandwidth):
