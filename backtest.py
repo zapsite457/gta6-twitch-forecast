@@ -75,15 +75,6 @@ def build_case(comp, others):
     """A grader-shaped case whose future hours are hidden in history."""
     day = main.parse_time(comp["day_start"])
     points = release_points(comp)
-    history = []
-    for off in sorted(points):
-        if off > 0:
-            continue
-        # Stamp at the hour's start, day_start + off hours.
-        epoch = day + off * 3600
-        # Reverse of parse_time is unnecessary: rebuild ISO from the offset via the source row.
-        history.append(off)
-    # Use the comparable's own timestamps so parsing matches the model.
     hourly = []
     for row in comp["hourly"]:
         off = main.hour_offset(row["from"], day)

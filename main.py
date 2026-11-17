@@ -32,9 +32,9 @@ PERSIST_SIGMA = 0.15
 
 # Tuned on leave-one-out pinball over the kit's analog launches. See backtest.py.
 PARAMS = {
-    "lam": 2.0,
-    "reg_w": 0.75,
-    "shrink": 0.05,
+    "lam": 4.0,
+    "reg_w": 0.8,
+    "shrink": 0.0,
     "shape_bw": 1.8,
     "log_bw": 3.2,
     "elev_bw": 2.4,
@@ -42,11 +42,17 @@ PARAMS = {
     "cross_mult": 0.5,
     "early_mult": 0.45,
     "early_match": 1.4,
-    "sm": 0.85,
-    "tail": 1.05,
-    "emp_blend": 0.45,
+    "sm": 0.95,
+    "tail": 1.2,
+    "emp_blend": 0.4,
     "min_sigma": 0.07,
     "peer_boost": 3.2,
+    "huber_cap": 1.6,
+    "huber_steps": 4,
+    "smooth": 0.7,
+    "log_bw_small": 1.35,
+    "small_p1": 12000.0,
+    "roll_mult": 1.0,
 }
 
 
@@ -257,7 +263,10 @@ def kernel_weight(target, analog):
         bw = PARAMS["shape_bw"]
         weight *= math.exp(-0.5 * (distance / bw) ** 2)
     log_gap = math.log(target["p1"] + 1.0) - math.log(analog["p1"] + 1.0)
-    weight *= math.exp(-0.5 * (log_gap / PARAMS["log_bw"]) ** 2)
+    log_bw = PARAMS["log_bw"]
+    if target["p1"] < PARAMS["small_p1"]:
+        log_bw = PARAMS["log_bw_small"]
+    weight *= math.exp(-0.5 * (log_gap / log_bw) ** 2)
     if target["elev"] is not None and analog["elev"] is not None:
         elev_gap = target["elev"] - analog["elev"]
         weight *= math.exp(-0.5 * (elev_gap / PARAMS["elev_bw"]) ** 2)
@@ -270,7 +279,7 @@ def kernel_weight(target, analog):
     if target["early"] and analog["early"]:
         weight *= PARAMS["early_match"]
     if target["rolling"] and analog["rolling"]:
-        weight *= 1.0
+        weight *= PARAMS["roll_mult"]
     weight *= peer_boost(analog["name"], target["console"], target["early"])
     return weight
 
@@ -280,8 +289,41 @@ def persistence_quantiles(p1, hour):
     return [p1 * math.exp(z * spread) for z in Z_SCORES]
 
 
+def ridge_fit(xs, ys, ws):
+    """Weighted ridge of y on x. Slope is penalized, intercept is free."""
+    total = sum(ws)
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total
+    var_x = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+    cov = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(ws, xs, ys))
+    slope = cov / (var_x + PARAMS["lam"])
+    intercept = mean_y - slope * mean_x
+    return intercept, slope
+
+
+def huber_fit(xs, ys, ws):
+    """Ridge, then Huber steps with a fixed log cap.
+
+    A scale taken from the whole pool treats the console afternoon wave as an
+    outlier and flattens it. Capping only residuals past about one log unit
+    (a factor of three) drops late-unlock spikes and keeps that wave.
+    """
+    intercept, slope = ridge_fit(xs, ys, ws)
+    cap = PARAMS["huber_cap"]
+    for _ in range(PARAMS["huber_steps"]):
+        robust = []
+        for weight, x, y in zip(ws, xs, ys):
+            gap = abs(y - (intercept + slope * x))
+            if gap <= cap:
+                robust.append(weight)
+            else:
+                robust.append(weight * cap / gap)
+        intercept, slope = ridge_fit(xs, ys, robust)
+    return intercept, slope
+
+
 def fit_hour(analogs, weights, hour, target_x):
-    """Ridge line of log-ratio on log(pre-peak), plus a weighted median."""
+    """Robust line of log-ratio on log(pre-peak), blended with a weighted median."""
     xs = []
     ys = []
     ws = []
@@ -293,13 +335,7 @@ def fit_hour(analogs, weights, hour, target_x):
         ws.append(weight)
     if not ys:
         return None
-    total = sum(ws)
-    mean_x = sum(w * x for w, x in zip(ws, xs)) / total
-    mean_y = sum(w * y for w, y in zip(ws, ys)) / total
-    var_x = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
-    cov = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(ws, xs, ys))
-    slope = cov / (var_x + PARAMS["lam"])
-    intercept = mean_y - slope * mean_x
+    intercept, slope = huber_fit(xs, ys, ws)
     fitted = intercept + slope * target_x
     center = weighted_quantile(ys, ws, 0.5)
     location = PARAMS["reg_w"] * fitted + (1.0 - PARAMS["reg_w"]) * center
@@ -394,15 +430,38 @@ def forecast_case(case):
     weights = [kernel_weight(target, record) for record in analogs]
     hours = []
     asked = case.get("forecast") or [{"hour": hour} for hour in range(2, 25)]
+    raw = []
     for row in sorted(asked, key=lambda item: item["hour"]):
         hour = int(row["hour"])
         fitted = fit_hour(analogs, weights, hour, target["x"])
         if fitted is None:
-            viewers = quantiles_to_viewers(p1, [math.log(q / p1) for q in persistence_quantiles(p1, hour)])
-        else:
-            viewers = quantiles_to_viewers(p1, fitted)
-        hours.append({"hour": hour, "q": viewers})
+            fitted = [math.log(q / p1) for q in persistence_quantiles(p1, hour)]
+        raw.append((hour, fitted))
+    raw = smooth_log_quantiles(raw, PARAMS["smooth"])
+    for hour, fitted in raw:
+        hours.append({"hour": hour, "q": quantiles_to_viewers(p1, fitted)})
     return {"hours": hours}
+
+
+def smooth_log_quantiles(rows, bandwidth):
+    """Pull each hour a little toward its neighbors. Zero bandwidth leaves rows alone."""
+    if bandwidth <= 0 or len(rows) < 3:
+        return rows
+    smoothed = []
+    for index, (hour, _) in enumerate(rows):
+        acc = [0.0] * 5
+        denom = 0.0
+        for other, (_, quantiles) in enumerate(rows):
+            weight = math.exp(-0.5 * ((index - other) / bandwidth) ** 2)
+            denom += weight
+            for k in range(5):
+                acc[k] += weight * quantiles[k]
+        merged = [value / denom for value in acc]
+        for k in range(1, 5):
+            if merged[k] < merged[k - 1]:
+                merged[k] = merged[k - 1]
+        smoothed.append((hour, merged))
+    return smoothed
 
 
 def dump_forecast(forecast):
