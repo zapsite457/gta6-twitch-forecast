@@ -23,34 +23,40 @@ BACKTEST_INPUT=/path/to/gta6-twitch-ccu-forecast-01-kit/input python3 backtest.p
 
 `main.py` forecasts quantiles of `log(CCU_h / CCU_hour1)` for hours 2 through 24.
 
-Comparable launches in the case are weighted with a Gaussian kernel on three things observed before the checkpoint: the shape of log viewers at the New Zealand, Asia, and late-Europe anchors (−13, −10, −7, −4, −2, −1 hours), the log of the hour-1 count, and how far hour 1 sits above the quiet baseline one to two days earlier. Console-only launches are upweighted. Early-access launches are downweighted when the target is a clean release. When the case includes them, Red Dead Redemption 2, Marvel's Spider-Man 2, Marvel's Wolverine, and God of War Ragnarök receive an extra weight, because they are the closest console peers.
+A console launch whose hour 1 is already at least 5,000 viewers uses a local model. Neighbors are weighted by the log gap in the pre-checkpoint peak (the 14 hours before hour 1, divided by hour 1) and by hour-1 level. Clean console analogs are upweighted. A ridge line in that dip, blended 70/30 with the weighted median, is the center. Quantile widths are a scaled MAD of the ridge residuals, with the 5% and 95% tails 1.15 times a normal. When the case includes them, Red Dead Redemption 2, Marvel's Spider-Man 2, Marvel's Wolverine, and God of War Ragnarök receive extra weight.
 
-On that weighted pool a ridge line maps `log(peak viewers in the 14 hours before hour 1 / hour-1 viewers)` to the log-ratio at each later hour. Huber steps cap residuals beyond 1.6 log units so a game that is still waiting to unlock cannot drag the line. The line is blended with the weighted median of the same pool (the class curve). Quantiles combine a normal scale, from the weighted MAD of residuals, with the empirical residual quantiles. Neighboring hours are smoothed with a Gaussian of bandwidth 0.7 hours, which keeps the post-unlock dip in hours 2–4 and the second wave in hours 18–22. If hour 1 is still below 12,000 viewers the level kernel tightens, so a quiet hour 1 is matched to other quiet hour-1 launches. An empty pool falls back to the house persistence curve.
+Every other launch keeps the broader kernel: shape at the New Zealand-to-Europe anchors, elevation over the quiet baseline, a Huber-capped ridge, and a light smooth across neighboring hours. A ridge on log(hour-1 viewers) was the strongest raw correlate of the afternoon wave on the selection half of the kit, and it made that half's console loss worse at every penalty that actually moved the fit, so the penalty is left large enough that the term is off.
 
-The release-day clock used to read those anchors is the one in the contest rules: local midnight rolls from New Zealand at 11:00 UTC the previous day through the US West Coast at 08:00 UTC, so hours 2–4 are after the Europe/UK unlock and hours 18–22 are US afternoon. Hourly viewer counts are the kit's SullyGnome series (SullyGnome.com hourly Twitch category averages, quoted in the kit's `input/NOTICE.txt`); this repo does not add counts from anywhere else.
+The release-day clock is the one in the contest rules: local midnight rolls from New Zealand at 11:00 UTC the previous day through the US West Coast at 08:00 UTC, so hours 2–4 follow the Europe/UK unlock and hours 18–22 are US afternoon. Hourly viewer counts are the kit's SullyGnome series (SullyGnome.com hourly Twitch category averages, quoted in the kit's `input/NOTICE.txt`). This repo does not add counts from anywhere else.
 
 ## Backtest
 
 Leave-one-out over the 37 analog launches in the kit that have all 24 release-day hours. Loss is the contest pinball loss on the log scale (lower is better). The baseline is the house persistence forecast: hour 1 held fixed, with normal spread `0.15 * sqrt(hour - 1)`.
 
-| Slice | n | Model | Persistence baseline |
+Launches are split by sorted name, even indexes in the selection half and odd indexes held out. Bandwidths and the ridge/median blend were chosen on the selection half only. The held-out half was scored after that choice. A full leave-one-out number is also shown; it includes the selection games, so it is the more flattering of the two.
+
+| Slice | n | Model | Persistence |
 | --- | --- | --- | --- |
-| Every analog launch | 37 | 0.417075 | 0.929650 |
-| Console-only, not early access, hour 1 at least 5,000 | 7 | 0.176068 | 0.343470 |
+| Selection half, all launches | 19 | 0.356102 | 0.704153 |
+| Selection half, console | 5 | 0.132272 | 0.385811 |
+| Held-out half, all launches | 18 | 0.475511 | 1.167676 |
+| Held-out half, console | 2 | 0.232241 | 0.237617 |
+| Full leave-one-out, all launches | 37 | 0.414193 | 0.929650 |
+| Full leave-one-out, console | 7 | 0.160835 | 0.343470 |
 
-Console-only games, model versus baseline:
+Console games:
 
-| Launch | Model | Baseline |
-| --- | --- | --- |
-| FINAL FANTASY VII REBIRTH | 0.109 | 0.173 |
-| Ghost of Tsushima | 0.082 | 0.228 |
-| Ghost of Yōtei | 0.157 | 0.473 |
-| Saros | 0.271 | 0.601 |
-| Stellar Blade | 0.129 | 0.372 |
-| The Last of Us Part II | 0.308 | 0.247 |
-| The Legend of Zelda: Tears of the Kingdom | 0.176 | 0.309 |
+| Launch | Half | Model | Persistence |
+| --- | --- | --- | --- |
+| FINAL FANTASY VII REBIRTH | selection | 0.102 | 0.173 |
+| Ghost of Yōtei | selection | 0.124 | 0.473 |
+| Saros | selection | 0.133 | 0.601 |
+| Stellar Blade | selection | 0.127 | 0.372 |
+| The Legend of Zelda: Tears of the Kingdom | selection | 0.175 | 0.309 |
+| Ghost of Tsushima | held out | 0.077 | 0.228 |
+| The Last of Us Part II | held out | 0.387 | 0.247 |
 
-The model beats persistence on 23 of the 37 launches. The remaining misses are mostly games whose hour-1 print is already the day's peak (a simultaneous PC unlock), where the afternoon wave is too high.
+The held-out console pair is essentially tied with persistence. Tsushima improves sharply. The Last of Us Part II, whose afternoon stays near 1.3× hour 1, gets worse: the local model still expects a stronger US wave. That is the gap to the practice top 20, whose cutoff is near 0.12 on the four official practice games. Those four answers are not in the kit, so this table is not that leaderboard. The model beats persistence on 23 of the 37 kit launches.
 
 ---
 

@@ -4,14 +4,14 @@ The grader runs `python3 -P -s /bot/main.py` with one case in the input director
 expects `/output/<id>.out`. This program reads every `*.in` case and writes the five
 quantiles (5%, 25%, 50%, 75%, 95%) of concurrent viewers for hours 2 through 24.
 
-The forecast is of log(CCU_h / CCU_hour1). Comparable launches in the case are
-kernel-weighted (Nadaraya-Watson) by how closely their pre-checkpoint path matches
-the target, then a ridge regression on log(pre-peak / hour-1) shifts that curve:
-a deep hour-1 dip after the New Zealand-to-Europe wave lines up with a further
-decline in hours 2-4 and a higher US-afternoon wave in hours 18-22. A light shrink
-toward persistence (log-ratio 0) and a class upweight for console-only launches
-stabilize the quantiles. Named console peers (Red Dead Redemption 2, Spider-Man 2,
-Wolverine, God of War Ragnarok) get extra weight when the case includes them.
+The forecast is of log(CCU_h / CCU_hour1). A console launch that already has an
+audience at hour 1 uses a local model: neighbors weighted by the pre-checkpoint
+dip and the hour-1 level, then a ridge line in that dip blended with the weighted
+median. Widths are a scaled MAD. Other launches keep the broader kernel regression.
+Named console peers (Red Dead Redemption 2, Spider-Man 2, Wolverine, God of War
+Ragnarok) get extra weight when the case includes them. A second ridge term on
+log(hour-1 viewers) was fit on one half of the kit and rejected there, so its
+penalty stays large enough to turn it off.
 """
 
 import json
@@ -53,6 +53,11 @@ PARAMS = {
     "log_bw_small": 1.35,
     "small_p1": 12000.0,
     "roll_mult": 1.0,
+    "spec_bw_x": 0.8,
+    "spec_bw_level": 3.0,
+    "spec_scale": 0.8,
+    "spec_ridge": 0.7,
+    "spec_lam_level": 1.0e9,
 }
 
 
@@ -322,6 +327,115 @@ def huber_fit(xs, ys, ws):
     return intercept, slope
 
 
+def specialist_log_quantiles(target, analogs):
+    """Local pre-peak model for a console launch that is already drawing viewers.
+
+    Neighbors are weighted by how close their pre-checkpoint dip and their hour-1
+    level are. A ridge line in that dip, blended with the weighted median, is the
+    location. Widths are a scaled MAD, wider in the tails than a plain normal.
+    Chosen on one half of the kit launches; the other half is the check.
+    """
+    bw_x = PARAMS["spec_bw_x"]
+    bw_level = PARAMS["spec_bw_level"]
+    scale = PARAMS["spec_scale"]
+    ridge_share = PARAMS["spec_ridge"]
+    xs = []
+    levels = []
+    curves = []
+    weights = []
+    for analog in analogs:
+        if analog["x"] is None or len(analog["future"]) < 12:
+            continue
+        weight = math.exp(-0.5 * ((target["x"] - analog["x"]) / bw_x) ** 2)
+        level_gap = math.log(target["p1"] + 1.0) - math.log(analog["p1"] + 1.0)
+        weight *= math.exp(-0.5 * (level_gap / bw_level) ** 2)
+        clean_console = analog["console"] and not analog["early"]
+        if clean_console:
+            weight *= 8.0
+        else:
+            weight *= 0.25
+        weight *= peer_boost(analog["name"], True, False)
+        if weight <= 1e-8:
+            continue
+        xs.append(analog["x"])
+        levels.append(math.log(analog["p1"] + 1.0))
+        curves.append(analog["future"])
+        weights.append(weight)
+    if not xs:
+        return None
+    rows = []
+    target_level = math.log(target["p1"] + 1.0)
+    for hour in range(2, 25):
+        column = []
+        used_w = []
+        used_x = []
+        used_level = []
+        for curve, weight, x_value, level in zip(curves, weights, xs, levels):
+            if hour not in curve:
+                continue
+            column.append(curve[hour])
+            used_w.append(weight)
+            used_x.append(x_value)
+            used_level.append(level)
+        if not column:
+            rows.append([0.0, 0.0, 0.0, 0.0, 0.0])
+            continue
+        used_total = sum(used_w)
+        mean_y = sum(weight * value for weight, value in zip(used_w, column)) / used_total
+        mean_x_hour = sum(weight * x_value for weight, x_value in zip(used_w, used_x)) / used_total
+        mean_level = sum(weight * level for weight, level in zip(used_w, used_level)) / used_total
+        var_x = sum(weight * (x_value - mean_x_hour) ** 2 for weight, x_value in zip(used_w, used_x))
+        var_level = sum(weight * (level - mean_level) ** 2 for weight, level in zip(used_w, used_level))
+        cov_x = sum(
+            weight * (x_value - mean_x_hour) * (value - mean_y)
+            for weight, x_value, value in zip(used_w, used_x, column)
+        )
+        cov_level = sum(
+            weight * (level - mean_level) * (value - mean_y)
+            for weight, level, value in zip(used_w, used_level, column)
+        )
+        cross = sum(
+            weight * (x_value - mean_x_hour) * (level - mean_level)
+            for weight, x_value, level in zip(used_w, used_x, used_level)
+        )
+        sxx = var_x + 0.8
+        sll = var_level + PARAMS["spec_lam_level"]
+        det = sxx * sll - cross * cross
+        if abs(det) < 1e-12:
+            slope = cov_x / sxx
+            slope_level = 0.0
+        else:
+            slope = (cov_x * sll - cov_level * cross) / det
+            slope_level = (cov_level * sxx - cov_x * cross) / det
+        fitted = (
+            mean_y
+            + slope * (target["x"] - mean_x_hour)
+            + slope_level * (target_level - mean_level)
+        )
+        center = weighted_quantile(column, used_w, 0.5)
+        location = ridge_share * fitted + (1.0 - ridge_share) * center
+        residuals = []
+        for value, x_value, level in zip(column, used_x, used_level):
+            analog_fit = (
+                mean_y
+                + slope * (x_value - mean_x_hour)
+                + slope_level * (level - mean_level)
+            )
+            residuals.append(value - analog_fit)
+        residual_median = weighted_quantile(residuals, used_w, 0.5)
+        mad = weighted_quantile([abs(item - residual_median) for item in residuals], used_w, 0.5)
+        sigma = max(1.4826 * mad, 0.08) * scale
+        quantiles = []
+        for z_value in Z_SCORES:
+            tail = 1.15 if abs(z_value) > 1.0 else 1.0
+            quantiles.append(location + z_value * sigma * tail)
+        for index in range(1, 5):
+            if quantiles[index] < quantiles[index - 1]:
+                quantiles[index] = quantiles[index - 1]
+        rows.append(quantiles)
+    return rows
+
+
 def fit_hour(analogs, weights, hour, target_x):
     """Robust line of log-ratio on log(pre-peak), blended with a weighted median."""
     xs = []
@@ -430,14 +544,20 @@ def forecast_case(case):
     weights = [kernel_weight(target, record) for record in analogs]
     hours = []
     asked = case.get("forecast") or [{"hour": hour} for hour in range(2, 25)]
+    clean_console = target["console"] and not target["early"] and p1 >= 5000
+    specialist = specialist_log_quantiles(target, analogs) if clean_console else None
     raw = []
     for row in sorted(asked, key=lambda item: item["hour"]):
         hour = int(row["hour"])
-        fitted = fit_hour(analogs, weights, hour, target["x"])
+        if specialist is not None:
+            fitted = specialist[hour - 2]
+        else:
+            fitted = fit_hour(analogs, weights, hour, target["x"])
         if fitted is None:
             fitted = [math.log(q / p1) for q in persistence_quantiles(p1, hour)]
         raw.append((hour, fitted))
-    raw = smooth_log_quantiles(raw, PARAMS["smooth"])
+    bandwidth = 0.0 if specialist is not None else PARAMS["smooth"]
+    raw = smooth_log_quantiles(raw, bandwidth)
     for hour, fitted in raw:
         hours.append({"hour": hour, "q": quantiles_to_viewers(p1, fitted)})
     return {"hours": hours}
